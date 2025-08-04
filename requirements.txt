@@ -1,0 +1,7 @@
+flask
+pandas
+openai
+gdown
+nest_asyncio
+openai-agents
+python_dotenv
