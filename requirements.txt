@@ -6,3 +6,5 @@ nest_asyncio
 openai-agents
 gunicorn
 python_dotenv
+openpyxl
+
