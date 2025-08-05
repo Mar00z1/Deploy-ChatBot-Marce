@@ -13,174 +13,110 @@ from flask import Flask, request, Response
 from dotenv import load_dotenv
 from agents import Agent, Runner
 from collections import defaultdict
-from httpx import HTTPStatusError, RequestError
 
-# ------------------- Setup inicial -------------------
+# Setup
 load_dotenv()
 nest_asyncio.apply()
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# Helper para obtener variables de entorno o lanzar error
 env = lambda var: os.getenv(var) or (_ for _ in ()).throw(RuntimeError(f"Falta definir {var}"))
-openai_key = env("OPENAI_API_KEY")
-refresh_token = os.getenv("REFRESH_TOKEN")
 twilio_sid = env("TWILIO_ACCOUNT_SID")
 twilio_token = env("TWILIO_AUTH_TOKEN")
-twilio_from = env("TWILIO_WHATSAPP_NUMBER")  # ej. "whatsapp:+1415XXXXXXX"
+twilio_from = env("TWILIO_WHATSAPP_NUMBER")
 
-# ------------------- Variables globales -------------------
 MEMORY_LIMIT = 100
 json_text = None
 agent = None
 user_histories = defaultdict(list)
 message_queue = queue.Queue()
-retry_counts = {}  # {(to, body): retry_count}
-max_retries = 3
 
-# ------------------- Función de envío simple (sin retries) -------------------
-def send_single_message(to: str, body: str) -> bool:
-    url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
-    data = {"From": twilio_from, "To": to, "Body": body}
-    auth = (twilio_sid, twilio_token)
-    try:
-        response = httpx.post(url, data=data, auth=auth, timeout=10)
-        response.raise_for_status()
-        logging.info(f"[Twilio] Mensaje enviado a {to}: {body[:50]}{'...' if len(body)>50 else ''}")
-        return True
-    except HTTPStatusError as e:
-        if e.response.status_code == 429:
-            logging.warning(f"[Twilio] Rate limit 429 para {to}")
-            return False
-        else:
-            logging.exception(f"[Twilio] Error HTTP {e.response.status_code} para {to}")
-            return True  # no retry on other errors
-    except RequestError as e:
-        logging.warning(f"[Twilio] Error de red para {to}: {e}")
-        return False
-
-# ------------------- Worker para manejar la cola y retries -------------------
+# Worker: sends one message every 2 seconds
 def message_worker():
     while True:
         to, body = message_queue.get()
-        key = (to, body)
-        success = send_single_message(to, body)
-        if not success:
-            count = retry_counts.get(key, 0)
-            if count < max_retries:
-                retry_counts[key] = count + 1
-                delay = 5 * (count + 1)
-                logging.info(f"Reenqueuing mensaje a {to} en {delay}s (retry {count+1}/{max_retries})")
-                threading.Timer(delay, lambda: message_queue.put((to, body))).start()
-            else:
-                logging.error(f"Descartando mensaje a {to} tras {max_retries} reintentos")
-                retry_counts.pop(key, None)
-        else:
-            retry_counts.pop(key, None)
-        time.sleep(2)  # ritmo fijo de 1 mensaje cada 2s
+        try:
+            httpx.post(
+                f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json",
+                data={"From": twilio_from, "To": to, "Body": body},
+                auth=(twilio_sid, twilio_token),
+                timeout=10
+            )
+            logging.info(f"Mensaje enviado a {to}: {body[:50]}")
+        except Exception:
+            logging.exception(f"Error enviando a {to}")
+        time.sleep(2)
         message_queue.task_done()
 
 threading.Thread(target=message_worker, daemon=True).start()
 
-# ------------------- Encolar mensajes -------------------
-def enqueue_whatsapp_message(to: str, body: str):
-    message_queue.put((to, body))
+# Utility
+def enqueue_message(to, body): message_queue.put((to, body))
+def normalize(number): return number if number.startswith("whatsapp:") else f"whatsapp:{number}"
 
-# ------------------- Normalizar prefijo WhatsApp -------------------
-def normalize_whatsapp(number: str) -> str:
-    n = number.strip()
-    return n if n.startswith("whatsapp:") else f"whatsapp:{n}"
-
-# ------------------- Cargar datos una sola vez -------------------
-def cargar_dataframe():
+# Load and cache Excel data
+ def cargar():
     global json_text
-    if json_text is None:
-        logging.info("Descargando y procesando archivo Excel...")
-        url = "https://drive.google.com/uc?id=1zSbeJRK2tBTQOQmbAkipfBccLbb4LL_1"
-        output = "MarcePrueba.xlsx"
-        gdown.download(url, output, quiet=True)
-        df_dict = pd.read_excel(output, sheet_name=None)
-        serializable = {key: df.to_dict(orient="records") for key, df in df_dict.items()}
-        json_text = json.dumps(serializable, ensure_ascii=False, indent=2, default=str)
-        logging.info("Excel procesado correctamente.")
+    if not json_text:
+        gdown.download(
+            "https://drive.google.com/uc?id=1zSbeJRK2tBTQOQmbAkipfBccLbb4LL_1",
+            "data.xlsx", quiet=True
+        )
+        dfs = pd.read_excel("data.xlsx", sheet_name=None)
+        json_text = json.dumps({k:v.to_dict(orient="records") for k,v in dfs.items()}, ensure_ascii=False)
     return json_text
 
-# ------------------- Inicializar agente una vez -------------------
-def inicializar_agente():
+# Initialize agent once
+ def get_agent():
     global agent
-    if agent is None:
-        datos = cargar_dataframe()
+    if not agent:
         agent = Agent(
             name="Excel_Read",
-            instructions=f"Sos un asistente de Llamas ventas. Usa este dataframe en texto plano para responder preguntas: {datos}",
+            instructions=f"Usa este JSON: {cargar()}",
             model="gpt-4.1"
         )
-        logging.info("Agente inicializado con GPT-4.1.")
     return agent
 
-# ------------------- Historial por usuario -------------------
-def actualizar_historial(user_id, user_input):
-    history = user_histories[user_id]
-    history.append({'role': 'user', 'content': user_input})
-    if len(history) > MEMORY_LIMIT * 2:
-        history = history[-MEMORY_LIMIT * 2:]
-    user_histories[user_id] = history
-    return history
+# History per user
+def record_history(uid, msg):
+    h = user_histories[uid]
+    h.append({"role":"user","content":msg})
+    user_histories[uid] = h[-MEMORY_LIMIT:]
 
-# ------------------- Procesamiento en segundo plano -------------------
-def process_and_send(user_input, user_id_raw, done_event: threading.Event):
-    user_id = normalize_whatsapp(user_id_raw)
-    try:
-        agent = inicializar_agente()
-        actualizar_historial(user_id, user_input)
-        result = Runner.run_sync(agent, user_input)
-        respuesta = result.final_output or "Lo siento, no pude generar una respuesta."
-        if len(respuesta) <= 1500:
-            enqueue_whatsapp_message(user_id, respuesta)
-        else:
-            for i in range(0, len(respuesta), 1500):
-                enqueue_whatsapp_message(user_id, respuesta[i:i+1500])
-    except Exception:
-        logging.exception(f"[Background][{user_id}] Error procesando mensaje")
-        enqueue_whatsapp_message(user_id, "Ocurrió un error procesando tu solicitud. Intenta nuevamente más tarde.")
-    finally:
-        done_event.set()
+# Background processing
+def process_input(msg, uid):
+    record_history(uid, msg)
+    res = Runner.run_sync(get_agent(), msg).final_output
+    text = res or "Error generando respuesta"
+    # split if long\ n
+    for i in range(0, len(text), 1500):
+        enqueue_message(uid, text[i:i+1500])
 
-# ------------------- Enviar mensaje de espera tras demora -------------------
-def delayed_send(user_id_raw, done_event: threading.Event, delay: int = 5):
-    user_id = normalize_whatsapp(user_id_raw)
-    time.sleep(delay)
-    if not done_event.is_set():
-        enqueue_whatsapp_message(user_id, "Un momento, estoy procesando tu solicitud...")
-
-# ------------------- Webhook principal -------------------
+# Webhook
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    user_input = request.values.get('Body', '').strip()
-    user_id_raw = request.values.get('From', '')
-    if not user_input:
-        return Response(status=400)
-    logging.info(f"[Webhook] Mensaje recibido de {user_id_raw}: {user_input}")
-    done_event = threading.Event()
-    threading.Thread(target=delayed_send, args=(user_id_raw, done_event), daemon=True).start()
-    threading.Thread(target=process_and_send, args=(user_input, user_id_raw, done_event), daemon=True).start()
+    msg = request.values.get('Body','').strip()
+    uid = normalize(request.values.get('From',''))
+    if not msg: return Response(status=400)
+    logging.info(f"Recibido de {uid}: {msg}")
+    enqueue_message(uid, "Procesando...")
+    threading.Thread(target=process_input, args=(msg,uid), daemon=True).start()
     return Response(status=200)
 
-# ------------------- Endpoint para refrescar el Excel -------------------
+# Refresh endpoint
 @app.route('/refresh', methods=['POST'])
-def refresh_excel():
-    token = request.headers.get("Authorization")
-    if refresh_token and token != refresh_token:
-        return "No autorizado", 403
+def refresh():
+    token = request.headers.get('Authorization')
+    if os.getenv('REFRESH_TOKEN') and token!=os.getenv('REFRESH_TOKEN'):
+        return "No autorizado",403
     global json_text, agent
-    json_text = None
-    agent = None
-    logging.info("Se forzó la recarga del Excel y el agente.")
-    return "Excel recargado correctamente", 200
+    json_text = None; agent = None
+    return "Refrescado",200
 
-# ------------------- Servidor local (opcional) -------------------
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+if __name__=='__main__':
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT',5000)))
+
+
 
 
 
