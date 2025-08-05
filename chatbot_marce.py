@@ -13,7 +13,7 @@ from flask import Flask, request, Response
 from dotenv import load_dotenv
 from agents import Agent, Runner
 from collections import defaultdict
-from httpx import HTTPStatusError
+from httpx import HTTPStatusError, RequestError
 
 # ------------------- Setup inicial -------------------
 load_dotenv()
@@ -54,10 +54,11 @@ def enqueue_whatsapp_message(to: str, body: str):
     message_queue.put((to, body))
 
 # ------------------- Envío real con retry (llamado por el worker) -------------------
-def send_whatsapp_message(to: str, body: str, max_retries: int = 3, backoff_base: float = 1.0):
+def send_whatsapp_message(to: str, body: str, max_retries: int = 5, backoff_base: float = 1.0):
     url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
     data = {"From": twilio_from, "To": to, "Body": body}
     auth = (twilio_sid, twilio_token)
+    
     for attempt in range(max_retries):
         try:
             response = httpx.post(url, data=data, auth=auth, timeout=10)
@@ -68,12 +69,16 @@ def send_whatsapp_message(to: str, body: str, max_retries: int = 3, backoff_base
             status = e.response.status_code
             if status == 429:
                 wait = backoff_base * (2 ** attempt)
-                logging.warning(f"429 recibido, retry en {wait:.1f}s (intento {attempt+1}/{max_retries})")
+                logging.warning(f"[Twilio] 429 Too Many Requests. Retry en {wait:.1f}s (intento {attempt+1}/{max_retries})")
                 time.sleep(wait)
             else:
-                logging.exception(f"Error enviando mensaje a {to}")
+                logging.exception(f"[Twilio] Error {status} al enviar mensaje a {to}")
                 break
-    logging.error(f"No se pudo enviar mensaje a {to} tras {max_retries} intentos")
+        except RequestError as e:
+            logging.warning(f"[Twilio] Error de red, intento {attempt+1}/{max_retries}: {e}")
+            time.sleep(backoff_base * (2 ** attempt))
+    
+    logging.error(f"[Twilio] No se pudo enviar mensaje a {to} tras {max_retries} intentos")
 
 # ------------------- Normalizar prefijo WhatsApp -------------------
 def normalize_whatsapp(number: str) -> str:
@@ -176,6 +181,8 @@ def refresh_excel():
 # ------------------- Servidor local (opcional) -------------------
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+
+
 
 
 
