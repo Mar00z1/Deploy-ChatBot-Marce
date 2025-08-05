@@ -35,50 +35,56 @@ json_text = None
 agent = None
 user_histories = defaultdict(list)
 message_queue = queue.Queue()
+retry_counts = {}  # {(to, body): retry_count}
+max_retries = 3
 
-# ------------------- Worker para manejar mensajes con rate limit -------------------
+# ------------------- Función de envío simple (sin retries) -------------------
+def send_single_message(to: str, body: str) -> bool:
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
+    data = {"From": twilio_from, "To": to, "Body": body}
+    auth = (twilio_sid, twilio_token)
+    try:
+        response = httpx.post(url, data=data, auth=auth, timeout=10)
+        response.raise_for_status()
+        logging.info(f"[Twilio] Mensaje enviado a {to}: {body[:50]}{'...' if len(body)>50 else ''}")
+        return True
+    except HTTPStatusError as e:
+        if e.response.status_code == 429:
+            logging.warning(f"[Twilio] Rate limit 429 para {to}")
+            return False
+        else:
+            logging.exception(f"[Twilio] Error HTTP {e.response.status_code} para {to}")
+            return True  # no retry on other errors
+    except RequestError as e:
+        logging.warning(f"[Twilio] Error de red para {to}: {e}")
+        return False
+
+# ------------------- Worker para manejar la cola y retries -------------------
 def message_worker():
     while True:
         to, body = message_queue.get()
-        try:
-            send_whatsapp_message(to, body)
-        except Exception:
-            logging.exception(f"[Worker] Error al enviar mensaje a {to}")
-        time.sleep(2)  # Límite de 1 msg cada 2 segundos
+        key = (to, body)
+        success = send_single_message(to, body)
+        if not success:
+            count = retry_counts.get(key, 0)
+            if count < max_retries:
+                retry_counts[key] = count + 1
+                delay = 5 * (count + 1)
+                logging.info(f"Reenqueuing mensaje a {to} en {delay}s (retry {count+1}/{max_retries})")
+                threading.Timer(delay, lambda: message_queue.put((to, body))).start()
+            else:
+                logging.error(f"Descartando mensaje a {to} tras {max_retries} reintentos")
+                retry_counts.pop(key, None)
+        else:
+            retry_counts.pop(key, None)
+        time.sleep(2)  # ritmo fijo de 1 mensaje cada 2s
         message_queue.task_done()
 
 threading.Thread(target=message_worker, daemon=True).start()
 
-# ------------------- Función para encolar mensajes -------------------
+# ------------------- Encolar mensajes -------------------
 def enqueue_whatsapp_message(to: str, body: str):
     message_queue.put((to, body))
-
-# ------------------- Envío real con retry (llamado por el worker) -------------------
-def send_whatsapp_message(to: str, body: str, max_retries: int = 5, backoff_base: float = 1.0):
-    url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
-    data = {"From": twilio_from, "To": to, "Body": body}
-    auth = (twilio_sid, twilio_token)
-    
-    for attempt in range(max_retries):
-        try:
-            response = httpx.post(url, data=data, auth=auth, timeout=10)
-            response.raise_for_status()
-            logging.info(f"[Twilio] Mensaje enviado a {to}: {body[:50]}{'...' if len(body)>50 else ''}")
-            return
-        except HTTPStatusError as e:
-            status = e.response.status_code
-            if status == 429:
-                wait = backoff_base * (2 ** attempt)
-                logging.warning(f"[Twilio] 429 Too Many Requests. Retry en {wait:.1f}s (intento {attempt+1}/{max_retries})")
-                time.sleep(wait)
-            else:
-                logging.exception(f"[Twilio] Error {status} al enviar mensaje a {to}")
-                break
-        except RequestError as e:
-            logging.warning(f"[Twilio] Error de red, intento {attempt+1}/{max_retries}: {e}")
-            time.sleep(backoff_base * (2 ** attempt))
-    
-    logging.error(f"[Twilio] No se pudo enviar mensaje a {to} tras {max_retries} intentos")
 
 # ------------------- Normalizar prefijo WhatsApp -------------------
 def normalize_whatsapp(number: str) -> str:
@@ -129,7 +135,6 @@ def process_and_send(user_input, user_id_raw, done_event: threading.Event):
         actualizar_historial(user_id, user_input)
         result = Runner.run_sync(agent, user_input)
         respuesta = result.final_output or "Lo siento, no pude generar una respuesta."
-        # solo split si excede 1500
         if len(respuesta) <= 1500:
             enqueue_whatsapp_message(user_id, respuesta)
         else:
@@ -146,25 +151,19 @@ def delayed_send(user_id_raw, done_event: threading.Event, delay: int = 5):
     user_id = normalize_whatsapp(user_id_raw)
     time.sleep(delay)
     if not done_event.is_set():
-        try:
-            enqueue_whatsapp_message(user_id, "Un momento, estoy procesando tu solicitud...")
-        except Exception:
-            logging.exception(f"[Delayed][{user_id}] Error enviando mensaje de espera")
+        enqueue_whatsapp_message(user_id, "Un momento, estoy procesando tu solicitud...")
 
-# ------------------- Webhook principal (dispara threads) -------------------
+# ------------------- Webhook principal -------------------
 @app.route('/webhook', methods=['POST'])
 def webhook():
     user_input = request.values.get('Body', '').strip()
     user_id_raw = request.values.get('From', '')
     if not user_input:
         return Response(status=400)
-
     logging.info(f"[Webhook] Mensaje recibido de {user_id_raw}: {user_input}")
     done_event = threading.Event()
-
     threading.Thread(target=delayed_send, args=(user_id_raw, done_event), daemon=True).start()
     threading.Thread(target=process_and_send, args=(user_input, user_id_raw, done_event), daemon=True).start()
-
     return Response(status=200)
 
 # ------------------- Endpoint para refrescar el Excel -------------------
@@ -173,7 +172,6 @@ def refresh_excel():
     token = request.headers.get("Authorization")
     if refresh_token and token != refresh_token:
         return "No autorizado", 403
-
     global json_text, agent
     json_text = None
     agent = None
@@ -183,6 +181,8 @@ def refresh_excel():
 # ------------------- Servidor local (opcional) -------------------
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+
+
 
 
 
