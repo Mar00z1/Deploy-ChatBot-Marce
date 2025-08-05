@@ -12,7 +12,6 @@ nest_asyncio.apply()
 app = Flask(__name__)
 
 # Configurar clave de OpenAI desde variable de entorno
-load_dotenv('apikey.env')
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # Límite de memoria para historial conversacional
@@ -69,3 +68,4 @@ def webhook():
 # Correr servidor
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+
