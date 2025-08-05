@@ -7,4 +7,5 @@ openai-agents
 gunicorn
 python_dotenv
 openpyxl
+twilio
 
