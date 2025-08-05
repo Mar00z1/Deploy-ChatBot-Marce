@@ -54,7 +54,7 @@ def inicializar_agente():
         agent = Agent(
             name="Excel_Read",
             instructions=f"Sos un asistente de Llamas ventas. Usa este dataframe en texto plano para responder preguntas: {datos}",
-            model="gpt-4.1"
+            model="gpt-4.1-mini"
         )
         logging.info("Agente inicializado.")
     return agent
@@ -112,5 +112,6 @@ def refresh_excel():
 # ------------------- Servidor local (opcional) -------------------
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+
 
 
