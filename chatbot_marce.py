@@ -44,12 +44,12 @@ def message_worker():
             send_whatsapp_message(to, body)
         except Exception:
             logging.exception(f"[Worker] Error al enviar mensaje a {to}")
-        time.sleep(1)  # Límite de 1 msg/seg
+        time.sleep(2)  # Límite de 1 msg cada 2 segundos
         message_queue.task_done()
 
 threading.Thread(target=message_worker, daemon=True).start()
 
-# ------------------- Función para enviar mensajes (usa cola) -------------------
+# ------------------- Función para encolar mensajes -------------------
 def enqueue_whatsapp_message(to: str, body: str):
     message_queue.put((to, body))
 
@@ -129,10 +129,12 @@ def process_and_send(user_input, user_id_raw, done_event: threading.Event):
         actualizar_historial(user_id, user_input)
         result = Runner.run_sync(agent, user_input)
         respuesta = result.final_output or "Lo siento, no pude generar una respuesta."
-        max_len = 1500
-        for i in range(0, len(respuesta), max_len):
-            chunk = respuesta[i:i+max_len]
-            enqueue_whatsapp_message(user_id, chunk)
+        # solo split si excede 1500
+        if len(respuesta) <= 1500:
+            enqueue_whatsapp_message(user_id, respuesta)
+        else:
+            for i in range(0, len(respuesta), 1500):
+                enqueue_whatsapp_message(user_id, respuesta[i:i+1500])
     except Exception:
         logging.exception(f"[Background][{user_id}] Error procesando mensaje")
         enqueue_whatsapp_message(user_id, "Ocurrió un error procesando tu solicitud. Intenta nuevamente más tarde.")
@@ -181,6 +183,7 @@ def refresh_excel():
 # ------------------- Servidor local (opcional) -------------------
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+
 
 
 
