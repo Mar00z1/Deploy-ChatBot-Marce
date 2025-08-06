@@ -36,15 +36,22 @@ TWILIO_FROM = env("TWILIO_WHATSAPP_NUMBER")
 
 # Constants
 MEMORY_LIMIT = 100
+MAX_RETRIES = 5
+BASE_DELAY = 1  # segundo
 json_text = None
 agent = None
 user_histories = defaultdict(list)
 message_queue = queue.Queue()
 
-# Worker: sends one message every 2 seconds, handles 429 rate-limit
+# Worker: sends one message every 2 seconds, handles 429 with exponential back-off
 def message_worker():
     while True:
-        to, body = message_queue.get()
+        item = message_queue.get()
+        if len(item) == 2:
+            to, body = item
+            retries = 0
+        else:
+            to, body, retries = item
         try:
             resp = httpx.post(
                 f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_SID}/Messages.json",
@@ -52,10 +59,13 @@ def message_worker():
                 auth=(TWILIO_SID, TWILIO_TOKEN),
                 timeout=10
             )
-            if resp.status_code == 429:
-                logging.warning(f"429 Rate limit hit for {to}, re-queueing message")
-                time.sleep(5)
-                message_queue.put((to, body))
+            if resp.status_code == 429 and retries < MAX_RETRIES:
+                retries += 1
+                delay = BASE_DELAY * (2 ** (retries - 1))
+                logging.warning(f"429 for {to}. Retry {retries}/{MAX_RETRIES} after {delay}s")
+                threading.Timer(delay, lambda: message_queue.put((to, body, retries))).start()
+            elif resp.status_code == 429:
+                logging.error(f"Dropped message to {to} after {retries} retries due to rate limit.")
             elif resp.is_success:
                 logging.info(f"Mensaje enviado a {to}: {body[:50]}")
             else:
@@ -63,15 +73,18 @@ def message_worker():
         except Exception:
             logging.exception(f"Error enviando a {to}")
         finally:
-            time.sleep(2)
             message_queue.task_done()
+            time.sleep(2)
 
 # Start the worker thread
 threading.Thread(target=message_worker, daemon=True).start()
 
 # Enqueue helper
-def enqueue_message(to, body):
-    message_queue.put((to, body))
+def enqueue_message(to, body, retries=0):
+    if retries:
+        message_queue.put((to, body, retries))
+    else:
+        message_queue.put((to, body))
 
 # Normalize number format
 def normalize(number):
@@ -129,7 +142,7 @@ def webhook():
     if not msg:
         return Response(status=400)
     logging.info(f"Recibido de {uid}: {msg}")
-    enqueue_message(uid, "Procesando...")
+    # Eliminado mensaje de 'Procesando...'
     threading.Thread(target=process_input, args=(msg, uid), daemon=True).start()
     return Response(status=200)
 
@@ -146,6 +159,8 @@ def refresh():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
+
+
 
 
 
