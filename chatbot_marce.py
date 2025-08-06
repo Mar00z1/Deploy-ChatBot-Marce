@@ -81,26 +81,37 @@ def webhook():
     respuesta = result.final_output or "Lo siento, no pude generar respuesta."
     logging.info("Respuesta generada: %s", respuesta)
 
-                # Construir y loguear respuesta TwiML para Twilio
-    xml = (
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        '<Response>'
-        '<Message>' + respuesta + '</Message>'
-        '</Response>'
+    # Enviar respuesta vía Twilio API usando plantilla
+    from twilio.rest import Client
+    account_sid = os.getenv('TWILIO_ACCOUNT_SID')
+    auth_token = os.getenv('TWILIO_AUTH_TOKEN')
+    twilio_client = Client(account_sid, auth_token)
+    to_number = request.values.get('From')  # p.ej. 'whatsapp:+549...'
+
+    # Configura el content_sid de tu plantilla aprobada
+    content_sid = 'HXb5b62575e6e4ff6129ad7c8efe1f983e'
+    # Si tu plantilla usa variables, mapea aquí
+    content_variables = json.dumps({"1": respuesta})
+
+    message = twilio_client.messages.create(
+        from_='whatsapp:' + os.getenv('TWILIO_WHATSAPP_NUMBER').split(':')[-1],
+        content_sid=content_sid,
+        content_variables=content_variables,
+        to=to_number
     )
-    logging.info("TwiML devuelto a Twilio: %s", xml)
-    # Twilio prefiere text/xml como Content-Type
-    return xml, 200, {'Content-Type': 'text/xml'}
+    logging.info("Mensaje enviado con SID: %s", message.sid)
+
+    return ('', 204)
 
 # Correr servidor
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logging.info(f"Arrancando servidor en 0.0.0.0:{port}")
-    app.run(host='0.0.0.0', port=port)
-if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=port) == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logging.info(f"Arrancando servidor en 0.0.0.0:{port}")
     app.run(host='0.0.0.0', port=port)
+
 
 
 
