@@ -47,36 +47,49 @@ message_queue = queue.Queue()
 def message_worker():
     while True:
         item = message_queue.get()
+        # unpack item
         if len(item) == 2:
             to, body = item
             retries = 0
         else:
             to, body, retries = item
-        try:
-            resp = httpx.post(
-                f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_SID}/Messages.json",
-                data={"From": TWILIO_FROM, "To": to, "Body": body},
-                auth=(TWILIO_SID, TWILIO_TOKEN),
-                timeout=10
-            )
-            if resp.status_code == 429 and retries < MAX_RETRIES:
-                retries += 1
-                delay = BASE_DELAY * (2 ** (retries - 1))
-                logging.warning(f"429 for {to}. Retry {retries}/{MAX_RETRIES} after {delay}s")
-                threading.Timer(delay, lambda: message_queue.put((to, body, retries))).start()
-            elif resp.status_code == 429:
-                logging.error(f"Dropped message to {to} after {retries} retries due to rate limit.")
-            elif resp.is_success:
-                logging.info(f"Mensaje enviado a {to}: {body[:50]}")
-            else:
-                logging.error(f"Error {resp.status_code} enviando a {to}: {resp.text}")
-        except Exception:
-            logging.exception(f"Error enviando a {to}")
-        finally:
-            message_queue.task_done()
+        # back-off parameters
+        delay = BASE_DELAY
+        success = False
+        while retries <= MAX_RETRIES:
+            try:
+                resp = httpx.post(
+                    f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_SID}/Messages.json",
+                    data={"From": TWILIO_FROM, "To": to, "Body": body},
+                    auth=(TWILIO_SID, TWILIO_TOKEN),
+                    timeout=10
+                )
+                if resp.status_code == 429:
+                    if retries < MAX_RETRIES:
+                        logging.warning(f"429 for {to}. Backing off {delay}s (retry {retries+1}/{MAX_RETRIES})")
+                        time.sleep(delay)
+                        retries += 1
+                        delay *= 2
+                        continue
+                    else:
+                        logging.error(f"Dropped message to {to} after {retries} retries due to rate limit.")
+                elif resp.is_success:
+                    logging.info(f"Mensaje enviado a {to}: {body[:50]}")
+                    success = True
+                else:
+                    logging.error(f"Error {resp.status_code} enviando a {to}: {resp.text}")
+                break
+            except Exception:
+                logging.exception(f"Error enviando a {to}")
+                break
+        # mark task done and wait before next send
+        message_queue.task_done()
+        if success:
+            # ensure spacing between messages
             time.sleep(2)
 
 # Start the worker thread
+threading.Thread(target=message_worker, daemon=True).start()
 threading.Thread(target=message_worker, daemon=True).start()
 
 # Enqueue helper
@@ -159,6 +172,8 @@ def refresh():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
+
+
 
 
 
