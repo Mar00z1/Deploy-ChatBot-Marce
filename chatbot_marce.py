@@ -81,10 +81,14 @@ def webhook():
     respuesta = result.final_output or "Lo siento, no pude generar respuesta."
     logging.info("Respuesta generada: %s", respuesta)
 
-    # Devolver XML a Twilio
+        # Devolver XML válido a Twilio
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
-        '<Response><Message>' + respuesta + '</Message></Response>'
+        '<Response>'
+        '<Message>'
+        '<Body>' + respuesta + '</Body>'
+        '</Message>'
+        '</Response>'
     )
     return xml, 200, {'Content-Type': 'application/xml'}
 
@@ -92,7 +96,11 @@ def webhook():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logging.info("Arrancando servidor en 0.0.0.0:%d", port)
+    app.run(host='0.0.0.0', port=port) == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    logging.info("Arrancando servidor en 0.0.0.0:%d", port)
     app.run(host='0.0.0.0', port=port)
+
 
 
 
