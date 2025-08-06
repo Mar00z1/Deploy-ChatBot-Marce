@@ -20,49 +20,62 @@ nest_asyncio.apply()
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
+# Environment helper
 def env(var):
     value = os.getenv(var)
     if not value:
         raise RuntimeError(f"Falta definir {var}")
     return value
 
-twilio_sid = env("TWILIO_ACCOUNT_SID")
-twilio_token = env("TWILIO_AUTH_TOKEN")
-twilio_from = env("TWILIO_WHATSAPP_NUMBER")
+# Twilio credentials
+TWILIO_SID = env("TWILIO_ACCOUNT_SID")
+TWILIO_TOKEN = env("TWILIO_AUTH_TOKEN")
+TWILIO_FROM = env("TWILIO_WHATSAPP_NUMBER")
 
+# Constants
 MEMORY_LIMIT = 100
 json_text = None
 agent = None
 user_histories = defaultdict(list)
 message_queue = queue.Queue()
 
-# Worker: sends one message every 2 seconds
+# Worker: sends one message every 2 seconds, with basic rate-limit handling
 def message_worker():
     while True:
         to, body = message_queue.get()
         try:
-            httpx.post(
-                f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json",
-                data={"From": twilio_from, "To": to, "Body": body},
-                auth=(twilio_sid, twilio_token),
+            resp = httpx.post(
+                f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_SID}/Messages.json",
+                data={"From": TWILIO_FROM, "To": to, "Body": body},
+                auth=(TWILIO_SID, TWILIO_TOKEN),
                 timeout=10
             )
-            logging.info(f"Mensaje enviado a {to}: {body[:50]}")
+            if resp.status_code == 429:
+                logging.warning(f"429 Rate limit hit for {to}, re-queueing message")
+                # back-off and requeue
+                time.sleep(5)
+                message_queue.put((to, body))
+            elif resp.is_success:
+                logging.info(f"Mensaje enviado a {to}: {body[:50]}")
+            else:
+                logging.error(f"Error {resp.status_code} enviando a {to}: {resp.text}")
         except Exception:
             logging.exception(f"Error enviando a {to}")
-        time.sleep(2)
-        message_queue.task_done()
+        finally:
+            time.sleep(2)
+            message_queue.task_done()
 
 threading.Thread(target=message_worker, daemon=True).start()
 
-# Utility
+# Enqueue helper
 def enqueue_message(to, body):
     message_queue.put((to, body))
 
+# Normalize number format
 def normalize(number):
     return number if number.startswith("whatsapp:") else f"whatsapp:{number}"
 
-# Load and cache Excel data
+# Load and cache Excel data, serializing timestamps
 def cargar():
     global json_text
     if json_text is None:
@@ -71,12 +84,18 @@ def cargar():
         output = "data.xlsx"
         gdown.download(url, output, quiet=True)
         df_dict = pd.read_excel(output, sheet_name=None)
-        serializable = {key: df.to_dict(orient="records") for key, df in df_dict.items()}
-        json_text = json.dumps(serializable, ensure_ascii=False)
+        # Convert any datetime columns to ISO strings
+        serializable = {}
+        for sheet, df in df_dict.items():
+            for col in df.select_dtypes(include=["datetime64[ns]"]):
+                df[col] = df[col].dt.isoformat()
+            serializable[sheet] = df.to_dict(orient="records")
+        # Use default=str to catch any leftover non-serializable
+        json_text = json.dumps(serializable, ensure_ascii=False, default=str)
         logging.info("Excel procesado correctamente.")
     return json_text
 
-# Initialize agent once
+# Initialize or retrieve agent
 def get_agent():
     global agent
     if agent is None:
@@ -88,21 +107,22 @@ def get_agent():
         logging.info("Agente inicializado con GPT-4.1.")
     return agent
 
-# History per user
+# Record user history with a memory limit
 def record_history(uid, msg):
     h = user_histories[uid]
     h.append({"role": "user", "content": msg})
     user_histories[uid] = h[-MEMORY_LIMIT:]
 
-# Background processing
+# Process incoming message in background
 def process_input(msg, uid):
     record_history(uid, msg)
     res = Runner.run_sync(get_agent(), msg).final_output
     text = res or "Error generando respuesta"
+    # Split into chunks for WhatsApp
     for i in range(0, len(text), 1500):
         enqueue_message(uid, text[i:i + 1500])
 
-# Webhook
+# Webhook endpoint
 @app.route('/webhook', methods=['POST'])
 def webhook():
     msg = request.values.get('Body', '').strip()
@@ -114,7 +134,7 @@ def webhook():
     threading.Thread(target=process_input, args=(msg, uid), daemon=True).start()
     return Response(status=200)
 
-# Refresh endpoint
+# Refresh endpoint to reload Excel and agent
 @app.route('/refresh', methods=['POST'])
 def refresh():
     token = request.headers.get('Authorization')
@@ -127,6 +147,7 @@ def refresh():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
+
 
 
 
