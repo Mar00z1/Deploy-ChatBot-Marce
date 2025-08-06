@@ -81,14 +81,16 @@ def webhook():
     respuesta = result.final_output or "Lo siento, no pude generar respuesta."
     logging.info("Respuesta generada: %s", respuesta)
 
-            # Devolver TwiML para Twilio (WhatsApp)
+                # Construir y loguear respuesta TwiML para Twilio
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<Response>'
         '<Message>' + respuesta + '</Message>'
         '</Response>'
     )
-    return xml, 200, {'Content-Type': 'application/xml'}
+    logging.info("TwiML devuelto a Twilio: %s", xml)
+    # Twilio prefiere text/xml como Content-Type
+    return xml, 200, {'Content-Type': 'text/xml'}
 
 # Correr servidor
 if __name__ == '__main__':
@@ -99,6 +101,8 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logging.info(f"Arrancando servidor en 0.0.0.0:{port}")
     app.run(host='0.0.0.0', port=port)
+
+
 
 
 
